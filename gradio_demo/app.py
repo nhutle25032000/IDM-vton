@@ -309,5 +309,11 @@ with image_blocks as demo:
             
 
 
-image_blocks.launch()
+image_blocks.launch(
+    server_name="0.0.0.0",  # Cho phép truy cập từ mọi IP
+    server_port=7860,       # Port mặc định, có thể đổi nếu cần
+    # share=True,           # Nếu muốn tạo link public qua Gradio (không cần thiết khi đã có server)
+    debug=True,           # Bật debug nếu muốn log chi tiết
+    # auth=("username", "password"), 
+)
 
