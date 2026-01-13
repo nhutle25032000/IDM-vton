@@ -1,7 +1,15 @@
 import sys
 sys.path.append('./')
 from PIL import Image
-import gradio as gr
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.responses import Response
+from fastapi.middleware.cors import CORSMiddleware
+import io
+import base64
+import json
+from typing import Optional
+import uvicorn
+
 from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
 from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel_ref
 from src.unet_hacked_tryon import UNet2DConditionModel
@@ -26,6 +34,18 @@ from preprocess.openpose.run_openpose import OpenPose
 from detectron2.data.detection_utils import convert_PIL_to_numpy,_apply_exif_orientation
 from torchvision.transforms.functional import to_pil_image
 
+# Khởi tạo FastAPI app
+app = FastAPI(title="IDM-VTON API", description="Virtual Try-on API", version="1.0.0")
+
+# CORS middleware để cho phép gọi từ frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
 def pil_to_binary_mask(pil_image, threshold=0):
@@ -41,9 +61,23 @@ def pil_to_binary_mask(pil_image, threshold=0):
     output_mask = Image.fromarray(mask)
     return output_mask
 
+def image_to_base64(image: Image.Image) -> str:
+    """Chuyển đổi PIL Image thành base64 string"""
+    buffered = io.BytesIO()
+    image.save(buffered, format="PNG")
+    img_str = base64.b64encode(buffered.getvalue()).decode()
+    return img_str
 
+def base64_to_image(base64_str: str) -> Image.Image:
+    """Chuyển đổi base64 string thành PIL Image"""
+    image_data = base64.b64decode(base64_str)
+    image = Image.open(io.BytesIO(image_data))
+    return image
+
+# Khởi tạo models (chỉ một lần khi start server)
 base_path = 'yisol/IDM-VTON'
-example_path = os.path.join(os.path.dirname(__file__), 'example')
+
+print("Loading models...")
 
 unet = UNet2DConditionModel.from_pretrained(
     base_path,
@@ -51,6 +85,7 @@ unet = UNet2DConditionModel.from_pretrained(
     torch_dtype=torch.float16,
 )
 unet.requires_grad_(False)
+
 tokenizer_one = AutoTokenizer.from_pretrained(
     base_path,
     subfolder="tokenizer",
@@ -79,13 +114,12 @@ image_encoder = CLIPVisionModelWithProjection.from_pretrained(
     base_path,
     subfolder="image_encoder",
     torch_dtype=torch.float16,
-    )
+)
 vae = AutoencoderKL.from_pretrained(base_path,
                                     subfolder="vae",
                                     torch_dtype=torch.float16,
 )
 
-# "stabilityai/stable-diffusion-xl-base-1.0",
 UNet_Encoder = UNet2DConditionModel_ref.from_pretrained(
     base_path,
     subfolder="unet_encoder",
@@ -101,36 +135,106 @@ vae.requires_grad_(False)
 unet.requires_grad_(False)
 text_encoder_one.requires_grad_(False)
 text_encoder_two.requires_grad_(False)
-tensor_transfrom = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-    )
+
+tensor_transfrom = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize([0.5], [0.5]),
+])
 
 pipe = TryonPipeline.from_pretrained(
-        base_path,
-        unet=unet,
-        vae=vae,
-        feature_extractor= CLIPImageProcessor(),
-        text_encoder = text_encoder_one,
-        text_encoder_2 = text_encoder_two,
-        tokenizer = tokenizer_one,
-        tokenizer_2 = tokenizer_two,
-        scheduler = noise_scheduler,
-        image_encoder=image_encoder,
-        torch_dtype=torch.float16,
+    base_path,
+    unet=unet,
+    vae=vae,
+    feature_extractor=CLIPImageProcessor(),
+    text_encoder=text_encoder_one,
+    text_encoder_2=text_encoder_two,
+    tokenizer=tokenizer_one,
+    tokenizer_2=tokenizer_two,
+    scheduler=noise_scheduler,
+    image_encoder=image_encoder,
+    torch_dtype=torch.float16,
 )
 pipe.unet_encoder = UNet_Encoder
 
-def start_tryon(dict,garm_img,garment_des,is_checked,is_checked_crop,denoise_steps,seed):
+print("Models loaded successfully!")
+
+@app.get("/")
+async def root():
+    return {"message": "IDM-VTON API is running!"}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "device": device}
+
+@app.post("/try-on")
+async def try_on_api(
+    human_image: UploadFile = File(..., description="Ảnh người (JPG, PNG)"),
+    garment_image: UploadFile = File(..., description="Ảnh quần áo (JPG, PNG)"),
+    garment_description: str = Form(..., description="Mô tả quần áo"),
+    mask_image: Optional[UploadFile] = File(None, description="Ảnh mask tùy chọn (nếu không dùng auto mask)"),
+    use_auto_mask: bool = Form(True, description="Sử dụng auto mask"),
+    use_auto_crop: bool = Form(False, description="Sử dụng auto crop và resize"),
+    denoise_steps: int = Form(30, description="Số bước denoise (20-40)"),
+    seed: int = Form(42, description="Seed cho random generator")
+):
+    try:
+        # Validate parameters
+        if denoise_steps < 20 or denoise_steps > 40:
+            raise HTTPException(status_code=400, detail="denoise_steps phải trong khoảng 20-40")
+        
+        if seed < -1 or seed > 2147483647:
+            raise HTTPException(status_code=400, detail="seed phải trong khoảng -1 đến 2147483647")
+        
+        # Đọc ảnh từ upload files
+        human_img_bytes = await human_image.read()
+        garment_img_bytes = await garment_image.read()
+        
+        human_img = Image.open(io.BytesIO(human_img_bytes)).convert("RGB")
+        garment_img = Image.open(io.BytesIO(garment_img_bytes)).convert("RGB")
+        
+        # Chuẩn bị dict cho human image (giống như ImageEditor trong Gradio)
+        human_dict = {
+            "background": human_img,
+            "layers": [Image.open(io.BytesIO(await mask_image.read())).convert("RGB")] if mask_image else [None],
+            "composite": None
+        }
+        
+        # Gọi hàm try-on
+        result_image, mask_image_result = await process_tryon(
+            human_dict, 
+            garment_img, 
+            garment_description, 
+            use_auto_mask, 
+            use_auto_crop, 
+            denoise_steps, 
+            seed
+        )
+        
+        # Chuyển đổi kết quả thành base64
+        result_base64 = image_to_base64(result_image)
+        mask_base64 = image_to_base64(mask_image_result)
+        
+        return {
+            "success": True,
+            "result_image": result_base64,
+            "mask_image": mask_base64,
+            "message": "Try-on completed successfully"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi xử lý: {str(e)}")
+
+async def process_tryon(dict_img, garm_img, garment_des, is_checked, is_checked_crop, denoise_steps, seed):
+    """
+    Hàm xử lý try-on (async version của start_tryon)
+    """
     
     openpose_model.preprocessor.body_estimation.model.to(device)
     pipe.to(device)
     pipe.unet_encoder.to(device)
 
-    garm_img= garm_img.convert("RGB").resize((768,1024))
-    human_img_orig = dict["background"].convert("RGB")    
+    garm_img = garm_img.convert("RGB").resize((768,1024))
+    human_img_orig = dict_img["background"].convert("RGB")    
     
     if is_checked_crop:
         width, height = human_img_orig.size
@@ -146,33 +250,33 @@ def start_tryon(dict,garm_img,garment_des,is_checked,is_checked_crop,denoise_ste
     else:
         human_img = human_img_orig.resize((768,1024))
 
-
     if is_checked:
         keypoints = openpose_model(human_img.resize((384,512)))
         model_parse, _ = parsing_model(human_img.resize((384,512)))
         mask, mask_gray = get_mask_location('hd', "upper_body", model_parse, keypoints)
         mask = mask.resize((768,1024))
     else:
-        mask = pil_to_binary_mask(dict['layers'][0].convert("RGB").resize((768, 1024)))
-        # mask = transforms.ToTensor()(mask)
-        # mask = mask.unsqueeze(0)
+        if dict_img['layers'][0] is not None:
+            mask = pil_to_binary_mask(dict_img['layers'][0].convert("RGB").resize((768, 1024)))
+        else:
+            # Nếu không có mask được cung cấp, sử dụng auto mask
+            keypoints = openpose_model(human_img.resize((384,512)))
+            model_parse, _ = parsing_model(human_img.resize((384,512)))
+            mask, mask_gray = get_mask_location('hd', "upper_body", model_parse, keypoints)
+            mask = mask.resize((768,1024))
+    
     mask_gray = (1-transforms.ToTensor()(mask)) * tensor_transfrom(human_img)
     mask_gray = to_pil_image((mask_gray+1.0)/2.0)
 
-
     human_img_arg = _apply_exif_orientation(human_img.resize((384,512)))
     human_img_arg = convert_PIL_to_numpy(human_img_arg, format="BGR")
-     
-    
 
     args = apply_net.create_argument_parser().parse_args(('show', './configs/densepose_rcnn_R_50_FPN_s1x.yaml', './ckpt/densepose/model_final_162be9.pkl', 'dp_segm', '-v', '--opts', 'MODEL.DEVICE', 'cuda'))
-    # verbosity = getattr(args, "verbosity", None)
-    pose_img = args.func(args,human_img_arg)    
+    pose_img = args.func(args, human_img_arg)    
     pose_img = pose_img[:,:,::-1]    
     pose_img = Image.fromarray(pose_img).resize((768,1024))
     
     with torch.no_grad():
-        # Extract the images
         with torch.cuda.amp.autocast():
             with torch.no_grad():
                 prompt = "model is wearing " + garment_des
@@ -209,10 +313,8 @@ def start_tryon(dict,garm_img,garment_des,is_checked,is_checked_crop,denoise_ste
                             negative_prompt=negative_prompt,
                         )
 
-
-
-                    pose_img =  tensor_transfrom(pose_img).unsqueeze(0).to(device,torch.float16)
-                    garm_tensor =  tensor_transfrom(garm_img).unsqueeze(0).to(device,torch.float16)
+                    pose_img = tensor_transfrom(pose_img).unsqueeze(0).to(device,torch.float16)
+                    garm_tensor = tensor_transfrom(garm_img).unsqueeze(0).to(device,torch.float16)
                     generator = torch.Generator(device).manual_seed(seed) if seed is not None else None
                     images = pipe(
                         prompt_embeds=prompt_embeds.to(device,torch.float16),
@@ -221,15 +323,15 @@ def start_tryon(dict,garm_img,garment_des,is_checked,is_checked_crop,denoise_ste
                         negative_pooled_prompt_embeds=negative_pooled_prompt_embeds.to(device,torch.float16),
                         num_inference_steps=denoise_steps,
                         generator=generator,
-                        strength = 1.0,
-                        pose_img = pose_img.to(device,torch.float16),
+                        strength=1.0,
+                        pose_img=pose_img.to(device,torch.float16),
                         text_embeds_cloth=prompt_embeds_c.to(device,torch.float16),
-                        cloth = garm_tensor.to(device,torch.float16),
+                        cloth=garm_tensor.to(device,torch.float16),
                         mask_image=mask,
                         image=human_img, 
                         height=1024,
                         width=768,
-                        ip_adapter_image = garm_img.resize((768,1024)),
+                        ip_adapter_image=garm_img.resize((768,1024)),
                         guidance_scale=2.0,
                     )[0]
 
@@ -239,114 +341,6 @@ def start_tryon(dict,garm_img,garment_des,is_checked,is_checked_crop,denoise_ste
         return human_img_orig, mask_gray
     else:
         return images[0], mask_gray
-    # return images[0], mask_gray
-
-garm_list = os.listdir(os.path.join(example_path,"cloth"))
-garm_list_path = [os.path.join(example_path,"cloth",garm) for garm in garm_list]
-
-human_list = os.listdir(os.path.join(example_path,"human"))
-human_list_path = [os.path.join(example_path,"human",human) for human in human_list]
-
-human_ex_list = []
-for ex_human in human_list_path:
-    ex_dict= {}
-    ex_dict['background'] = ex_human
-    ex_dict['layers'] = None
-    ex_dict['composite'] = None
-    human_ex_list.append(ex_dict)
-
-##default human
-
-
-# Tạo interface với cách tiếp cận đơn giản hơn để tránh lỗi schema
-def create_demo():
-    with gr.Blocks(title="IDM-VTON") as demo:
-        gr.Markdown("## IDM-VTON 👕👔👚")
-        gr.Markdown("Virtual Try-on with your image and garment image. Check out the [source codes](https://github.com/yisol/IDM-VTON) and the [model](https://huggingface.co/yisol/IDM-VTON)")
-        
-        with gr.Row():
-            with gr.Column():
-                imgs = gr.ImageEditor(
-                    label='Human. Mask with pen or use auto-masking',
-                    type="pil",
-                    sources=['upload'],
-                    interactive=True
-                )
-                with gr.Row():
-                    is_checked = gr.Checkbox(
-                        label="Use auto-generated mask", 
-                        info="Takes 5 seconds",
-                        value=True
-                    )
-                with gr.Row():
-                    is_checked_crop = gr.Checkbox(
-                        label="Use auto-crop & resizing",
-                        value=False
-                    )
-
-                gr.Examples(
-                    examples=human_ex_list,
-                    inputs=imgs,
-                    examples_per_page=10
-                )
-
-            with gr.Column():
-                garm_img = gr.Image(
-                    label="Garment", 
-                    sources=['upload'], 
-                    type="pil"
-                )
-                with gr.Row():
-                    prompt = gr.Textbox(
-                        placeholder="Description of garment ex) Short Sleeve Round Neck T-shirts", 
-                        show_label=False
-                    )
-                gr.Examples(
-                    examples=garm_list_path,
-                    inputs=garm_img,
-                    examples_per_page=8
-                )
-                
-            with gr.Column():
-                masked_img = gr.Image(
-                    label="Masked image output",
-                    show_share_button=False
-                )
-            with gr.Column():
-                image_out = gr.Image(
-                    label="Output",
-                    show_share_button=False
-                )
-
-        with gr.Column():
-            try_button = gr.Button("Try-on", variant="primary")
-            with gr.Accordion("Advanced Settings", open=False):
-                with gr.Row():
-                    denoise_steps = gr.Number(
-                        label="Denoising Steps", 
-                        minimum=20, 
-                        maximum=40, 
-                        value=30, 
-                        step=1
-                    )
-                    seed = gr.Number(
-                        label="Seed", 
-                        minimum=-1, 
-                        maximum=2147483647, 
-                        step=1, 
-                        value=42
-                    )
-
-        try_button.click(
-            fn=start_tryon, 
-            inputs=[imgs, garm_img, prompt, is_checked, is_checked_crop, denoise_steps, seed], 
-            outputs=[image_out, masked_img]
-        )
-
-    return demo
 
 if __name__ == "__main__":
-    demo = create_demo()
-    demo.queue()
-    demo.launch()
-
+    uvicorn.run(app, host="0.0.0.0", port=8000) 
